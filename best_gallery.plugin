@@ -1,0 +1,803 @@
+"""Fork of Delete From Gallery 1.0 by @itNotMax / @MaxExteraPlugins.
+
+Target source: exteraless v12.10.6-beta14, 00c14f4.
+Original plugin is preserved separately in upstream/.
+"""
+
+__id__ = "best_gallery"
+__name__ = "Best gallery"
+__description__ = "Три кнопки в галерее: удалить, отправить и удалить, отправить файлом и удалить. Удаление после подтверждённой отправки."
+__author__ = "Ovolsan; original: @itNotMax / @MaxExteraPlugins"
+__version__ = "1.2.0"
+__icon__ = "msg_gallery"
+__min_version__ = "12.10.6"
+__app_version__ = ">=12.10.6"
+__permissions__ = ["ui", "hooks", "files", "intents", "messages.read", "messages.send"]
+
+import re
+import time
+import posixpath
+
+from base_plugin import BasePlugin
+from android_utils import OnClickListener, run_on_ui_thread
+from hook_utils import get_private_field
+
+
+DELETE_REQUEST = 28106
+FOLDER_REQUEST = 28107
+DOCUMENTS_AUTHORITY = "com.android.externalstorage.documents"
+PHOTO_LAYOUT = "org.telegram.ui.Components.ChatAttachAlertPhotoLayout"
+ALERT = "org.telegram.ui.Components.ChatAttachAlert"
+SEND_HELPER = "org.telegram.messenger.SendMessagesHelper"
+
+# Small outline glyphs, with the same rounded strokes as the native menu.
+# The media glyph deliberately ends in pixels, rather than an HQ/SD label.
+_ARROW = '<path d="M13 22h8m-3-3 3 3-3 3"/>'
+ICONS = {
+    "media": '<path d="M14 5H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h7m-7-4 4-4 4 4m-6-6h.01"/>'
+             '<path d="M17 5h.01m4 0h.01m-4 4h.01m4 0h.01m-4 4h.01m4 0h.01m-4 4h.01m4 0h.01"/>' + _ARROW,
+    "file": '<path d="M13 3H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h8m0-16 6 6v4M13 3v6h6"/>' + _ARROW,
+}
+
+
+def svg_icon(kind):
+    # Telegram's SVG parser does not inherit stroke attributes from <g>.
+    paths = ICONS[kind].replace('<path ', '<path fill="none" stroke="#ffffff" '
+                               'stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" ')
+    return ('<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" '
+            'viewBox="0 0 36 36">' + paths + '</svg>')
+
+
+def matches_original_path(value, path):
+    """Telegram appends size/mtime, and optional video edit fields, to paths."""
+    if not value or not path:
+        return False
+    if value == path:
+        return True
+    if not value.startswith(path):
+        return False
+    return bool(re.fullmatch(r"\d+_\d+(?:_\d+)*(?:_m)?(?:_\d+)?", value[len(path):]))
+
+
+def storage_document_id(path, primary_root):
+    """Map a local media path to ExternalStorageProvider's document id."""
+    if not path or ".." in path.split("/"):
+        return None
+    path = posixpath.normpath(path)
+    for root in (primary_root.rstrip("/"), "/sdcard", "/storage/self/primary"):
+        if path.startswith(root + "/"):
+            return "primary:" + path[len(root) + 1:]
+    parts = path.split("/")
+    if len(parts) >= 4 and parts[1] == "storage" and parts[2] not in ("emulated", "self"):
+        return parts[2] + ":" + "/".join(parts[3:])
+    return None
+
+
+def tree_contains(tree_id, document_id):
+    if not tree_id or not document_id or ":" not in tree_id or ":" not in document_id:
+        return False
+    volume, folder = tree_id.split(":", 1)
+    other_volume, filename = document_id.split(":", 1)
+    if volume != other_volume or ".." in folder.split("/") or ".." in filename.split("/"):
+        return False
+    return bool(filename) and (not folder or filename.startswith(folder.rstrip("/") + "/"))
+
+
+class SendBatch:
+    """A batch is deletable only when EVERY selected entry has a server ACK."""
+
+    def __init__(self, account, dialog, entries):
+        self.account = account
+        self.dialog = dialog
+        self.entries = entries
+        self.bound = {}
+        self.confirmed = set()
+        self.created = time.monotonic()
+
+    def bind(self, account, dialog, message_id, paths, scheduled=False):
+        if scheduled or account != self.account or dialog != self.dialog or message_id >= 0:
+            return False
+        if message_id in self.bound:
+            return True
+        used = set(self.bound.values())
+        for index, entry in enumerate(self.entries):
+            if index in used:
+                continue
+            if any(matches_original_path(value, path) for value in paths
+                   for path in entry["send_paths"]):
+                self.bound[message_id] = index
+                return True
+        return False
+
+    def acknowledge(self, account, dialog, old_id, scheduled=False):
+        if scheduled or account != self.account or dialog != self.dialog:
+            return False
+        index = self.bound.get(old_id)
+        if index is None:
+            return False
+        self.confirmed.add(index)
+        return len(self.confirmed) == len(self.entries)
+
+
+class BestGalleryPlugin(BasePlugin):
+    def create_settings(self):
+        from ui.settings import Switch, Divider
+        return [Switch(key="folder_delete", text="Удалять без повторного подтверждения", default=True,
+                       subtext="Android один раз запросит доступ к папке с выбранными файлами."),
+                Divider("Доступ сохраняется после перезапуска. Для файлов в другой папке нужно разрешить её отдельно. "
+                        "Корень хранилища и папка Download ограничены Android.")]
+
+    def on_plugin_load(self):
+        self._alive = True
+        self._rows = {}
+        self._batch = None
+        self._delete_request = None
+        self._observer = None
+        self._observing_account = None
+        self._send_hooks_ok = False
+        self._initiating = False
+        try:
+            # Name-based SDK hooks enumerate every LaunchActivity method. On
+            # Android 11 that resolves an unrelated API-31 PictureInPicture type.
+            # Resolve only our exact method so the plugin also works on API 30.
+            from java.lang import Class, Integer
+            result_method = Class.forName("org.telegram.ui.LaunchActivity").getDeclaredMethod(
+                "onActivityResult", Integer.TYPE, Integer.TYPE, Class.forName("android.content.Intent"))
+            result_method.setAccessible(True)
+            required = [
+                self.hook_method((PHOTO_LAYOUT, "onSelectedItemsCountChanged"), after=self._selection_changed),
+                self.hook_method((PHOTO_LAYOUT, "onDestroy"), before=self._layout_destroyed),
+                self.hook_method(result_method, after=self._activity_result),
+            ]
+            send_hooks = [
+                self.hook_method((SEND_HELPER, "putToSendingMessages"), before=self._sending_message),
+                self.hook_method((SEND_HELPER, "putToUploadingMessages"), before=self._uploading_message),
+            ]
+            self._send_hooks_ok = all(send_hooks)
+            native_send_hooks = [
+                self.hook_method((ALERT, "onWriteButtonPressed"), before=self._plain_send),
+                self.hook_method((PHOTO_LAYOUT, "onMenuItemClick"), before=self._plain_send),
+            ]
+            self._send_hooks_ok = self._send_hooks_ok and all(native_send_hooks)
+            if not all(required):
+                raise RuntimeError("Не удалось зарегистрировать хуки галереи")
+            self.log(f"Best gallery {__version__} loaded; target 12.10.6-beta14; "
+                     f"direct delete access={self._has_direct_delete_access()}")
+        except Exception as error:
+            self.log(f"Best gallery: load: {error}")
+            self._bulletin("error", "Best gallery: не удалось подключиться к галерее")
+
+    def on_plugin_unload(self):
+        self._alive = False
+        self._stop_observing()
+        self._batch = None
+        self._delete_request = None
+        rows = list(self._rows.values())
+        self._rows.clear()
+        run_on_ui_thread(lambda: [self._remove_row(row) for row in rows])
+
+    def _bulletin(self, kind, text):
+        from ui.bulletin import BulletinHelper
+        run_on_ui_thread(lambda: getattr(BulletinHelper, "show_" + kind)(text))
+
+    @staticmethod
+    def _identity(obj):
+        from java.lang import System
+        return int(System.identityHashCode(obj))
+
+    def _selection_changed(self, param):
+        try:
+            layout = param.thisObject
+            alert = get_private_field(layout, "parentAlert")
+            if alert is None:
+                return
+            key = self._identity(alert)
+            count = int(param.args[0])
+            row = self._rows.get(key)
+            if row is None and count > 0:
+                row = self._make_row(layout, alert)
+                self._rows[key] = row
+            if row is not None:
+                row["layout"] = layout
+                self._set_row_visible(row, count > 0)
+                self._fit_header(row)
+        except Exception as error:
+            self.log(f"Best gallery: header: {error}")
+
+    def _make_row(self, layout, alert):
+        from android.widget import LinearLayout, ImageView, FrameLayout
+        from android.view import Gravity
+        from org.telegram.messenger import AndroidUtilities
+        from org.telegram.ui.ActionBar import Theme
+        from java import jclass, dynamic_proxy
+
+        selected = get_private_field(alert, "selectedView")
+        text = get_private_field(alert, "selectedTextView")
+        menu = get_private_field(alert, "selectedMenuItem")
+        action_bar = get_private_field(alert, "actionBar")
+        if selected is None or text is None or menu is None:
+            raise RuntimeError("Missing native gallery header")
+        dp = AndroidUtilities.dp
+        group = LinearLayout(selected.getContext())
+        group.setOrientation(0)
+        group.setGravity(Gravity.CENTER_VERTICAL)
+        group.setBaselineAligned(False)
+        color = int(text.getCurrentTextColor())
+        actions = (("delete", "Удалить с устройства"),
+                   ("media", "Отправить и удалить"),
+                   ("file", "Отправить файлом и удалить"))
+        row = {"group": group, "layout": layout, "alert": alert,
+               "selected": selected, "text": text, "menu": menu,
+               "header": selected.getParent(), "action_bar": action_bar,
+               "max_width": text.getMaxWidth(), "visible": None,
+               "menu_params": menu.getLayoutParams(),
+               "icon_view": menu.getIconView(),
+               "icon_params": menu.getIconView().getLayoutParams(),
+               "forced_width": int(get_private_field(action_bar, "forcedMenuWidth")),
+               "dropdown": get_private_field(layout, "dropDown")}
+        if row["dropdown"] is not None:
+            row["dropdown_max"] = row["dropdown"].getMaxWidth()
+        row["motion"] = get_private_field(alert, "motionItem")
+        if row["motion"] is not None:
+            row["motion_params"] = row["motion"].getLayoutParams()
+        for kind, label in actions:
+            button = ImageView(selected.getContext())
+            button.setScaleType(ImageView.ScaleType.FIT_CENTER)
+            if kind == "delete":
+                button.setPadding(dp(12), dp(14), dp(12), dp(14))
+            else:
+                button.setPadding(dp(6), dp(8), dp(6), dp(8))
+            button.setImageDrawable(self._icon(selected.getContext(), kind, color))
+            button.setContentDescription(label)
+            button.setBackground(Theme.createSelectorDrawable(Theme.getColor(Theme.key_dialogButtonSelector), 6))
+            button.setOnClickListener(OnClickListener(lambda v, k=kind: self._action(row, k)))
+            group.addView(button, LinearLayout.LayoutParams(dp(44), dp(48)))
+
+        # The overflow item is already moved by native code between the sheet
+        # header and the pinned action bar. Keep the whole clickable strip in
+        # that item: no dependence on text length, and no scroll/frame hooks.
+        icon_params = FrameLayout.LayoutParams(dp(48), -1, Gravity.RIGHT | Gravity.CENTER_VERTICAL)
+        menu.getIconView().setLayoutParams(icon_params)
+        group_params = FrameLayout.LayoutParams(dp(132), dp(48), Gravity.RIGHT | Gravity.CENTER_VERTICAL)
+        group_params.rightMargin = dp(48)
+        menu.addView(group, group_params)
+
+        # Width changes only (rotation, split screen), never a Python frame loop.
+        container = menu.getParent()
+        plugin = self
+        class WidthListener(dynamic_proxy(jclass("android.view.View$OnLayoutChangeListener"))):
+            def onLayoutChange(self, view, left, top, right, bottom, *old):
+                plugin._fit_header(row)
+        row["container"] = container
+        row["listener"] = WidthListener()
+        container.addOnLayoutChangeListener(row["listener"])
+        menu.addOnLayoutChangeListener(row["listener"])
+        self._set_row_visible(row, True)
+        return row
+
+    @staticmethod
+    def _set_row_visible(row, visible):
+        from android.widget import FrameLayout
+        from org.telegram.messenger import AndroidUtilities
+        if row["visible"] == visible:
+            return
+        row["visible"] = visible
+        row["group"].setVisibility(0 if visible else 8)
+        params = FrameLayout.LayoutParams(row["menu_params"])
+        params.width = row["menu_params"].width + (AndroidUtilities.dp(132) if visible else 0)
+        row["menu"].setLayoutParams(params)
+        row["action_bar"].setForcedMenuWidth(row["forced_width"] + (AndroidUtilities.dp(132) if visible else 0))
+        if row["motion"] is not None:
+            motion_params = FrameLayout.LayoutParams(row["motion_params"])
+            motion_params.rightMargin += AndroidUtilities.dp(132) if visible else 0
+            row["motion"].setLayoutParams(motion_params)
+        if not visible:
+            row["text"].setMaxWidth(row["max_width"])
+            if row["dropdown"] is not None:
+                row["dropdown"].setMaxWidth(row["dropdown_max"])
+        BestGalleryPlugin._fit_header(row)
+
+    @staticmethod
+    def _icon(context, kind, color):
+        from android.graphics import Bitmap, Canvas, Paint, PorterDuff, PorterDuffColorFilter
+        from android.graphics.drawable import BitmapDrawable
+        from org.telegram.messenger import AndroidUtilities, R, SvgHelper
+        resources = context.getResources()
+        # The exact same drawable used by the original "Delete from device"
+        # menu item in the user's screenshot, including native icon-pack support.
+        trash = resources.getDrawable(R.drawable.msg_delete).mutate()
+        trash.setColorFilter(PorterDuffColorFilter(color, PorterDuff.Mode.SRC_IN))
+        if kind == "delete":
+            return trash
+        base = SvgHelper.getDrawable(svg_icon(kind))
+        if base is None:
+            raise RuntimeError("SVG icon could not be parsed")
+        paint = Paint(1)
+        paint.setStyle(Paint.Style.STROKE)
+        paint.setStrokeWidth(1.7)
+        paint.setStrokeCap(Paint.Cap.ROUND)
+        paint.setStrokeJoin(Paint.Join.ROUND)
+        paint.setColor(color)
+        base.setPaint(paint)
+        dp = AndroidUtilities.dp
+        size = dp(36)
+        bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        bitmap.setDensity(resources.getDisplayMetrics().densityDpi)
+        canvas = Canvas(bitmap)
+        # Centre the visible artwork, not the SVG's asymmetric empty margins.
+        canvas.translate(-float(dp(1)), float(dp(2)))
+        base.setBounds(0, 0, size, size)
+        base.draw(canvas)
+        trash.setBounds(dp(23), dp(13), dp(36), dp(28))
+        trash.draw(canvas)
+        # Render once per gallery header; no Python drawing during animations.
+        return BitmapDrawable(resources, bitmap)
+
+    @staticmethod
+    def _fit_header(row):
+        from org.telegram.messenger import AndroidUtilities
+        if not row["visible"]:
+            return
+        width = int(row["container"].getWidth())
+        if width <= 0:
+            return
+        params = row["menu"].getLayoutParams()
+        menu_left = width - row["container"].getPaddingRight() - params.rightMargin - params.width
+        # Live Photo has its own native sibling button. Reserve its space to
+        # the left of our strip, without changing the strip's overflow anchor.
+        motion_width = 0
+        if (row["motion"] is not None
+                and bool(get_private_field(row["alert"], "allowLivePhotos"))
+                and get_private_field(row["alert"], "currentAttachLayout") == row["layout"]
+                and row["layout"].hasLivePhotos()):
+            motion_width = AndroidUtilities.dp(48)
+        menu_left -= motion_width
+        forced_width = row["forced_width"] + AndroidUtilities.dp(132) + motion_width
+        if int(get_private_field(row["action_bar"], "forcedMenuWidth")) != forced_width:
+            row["action_bar"].setForcedMenuWidth(forced_width)
+        header_left = row["header"].getLeft()
+        if header_left == 0:
+            header_left = row["header"].getLayoutParams().leftMargin + row["container"].getPaddingLeft()
+        # Leave room for the native selection arrow; only text is ellipsized.
+        row["text"].setMaxWidth(max(AndroidUtilities.dp(32), menu_left - header_left - AndroidUtilities.dp(24)))
+        if row["dropdown"] is not None:
+            dropdown = row["dropdown"]
+            dropdown_left = dropdown.getParent().getLayoutParams().leftMargin + AndroidUtilities.dp(16)
+            dropdown.setMaxWidth(max(AndroidUtilities.dp(40), menu_left - dropdown_left - AndroidUtilities.dp(8)))
+
+    @staticmethod
+    def _remove_row(row):
+        try:
+            row["container"].removeOnLayoutChangeListener(row["listener"])
+            row["menu"].removeOnLayoutChangeListener(row["listener"])
+            row["menu"].removeView(row["group"])
+            row["menu"].setLayoutParams(row["menu_params"])
+            row["icon_view"].setLayoutParams(row["icon_params"])
+            if row["motion"] is not None:
+                row["motion"].setLayoutParams(row["motion_params"])
+            row["action_bar"].setForcedMenuWidth(row["forced_width"])
+            row["text"].setMaxWidth(row["max_width"])
+            if row["dropdown"] is not None:
+                row["dropdown"].setMaxWidth(row["dropdown_max"])
+        except Exception:
+            pass
+
+    def _layout_destroyed(self, param):
+        alert = get_private_field(param.thisObject, "parentAlert")
+        if alert is not None:
+            row = self._rows.pop(self._identity(alert), None)
+            if row is not None:
+                self._remove_row(row)
+
+    @staticmethod
+    def _snapshot(layout):
+        from java.io import File
+        from java.lang import Integer
+        from java import cast, jclass
+        selected = layout.getSelectedPhotos()
+        order = layout.getSelectedPhotosOrder()
+        entries = []
+        for i in range(order.size()):
+            # Object-returning collection methods unbox Integer to Python int.
+            # Rebox explicitly: HashMap.get(Object) otherwise receives Long.
+            key = cast(jclass("java.lang.Object"), Integer(int(order.get(i))))
+            entry = selected.get(key)
+            if entry is None:
+                raise ValueError("Выделение изменилось. Выберите файлы заново")
+            path = str(entry.path) if entry.path is not None else ""
+            file = File(path)
+            if int(entry.imageId) <= 0 or not path or not file.isFile():
+                raise ValueError("Сначала сохраните выбранные файлы в галерею устройства")
+            paths = {path}
+            if entry.imagePath is not None:
+                paths.add(str(entry.imagePath))
+            entries.append({"key": key, "id": int(entry.imageId), "video": bool(entry.isVideo),
+                            "path": path, "size": int(file.length()),
+                            "mtime": int(file.lastModified()), "send_paths": paths})
+        if not entries:
+            raise ValueError("Нет выбранных файлов")
+        return entries
+
+    def _action(self, row, kind):
+        try:
+            if self._delete_request is not None or self._batch is not None:
+                self._bulletin("info", "Дождитесь завершения предыдущей операции")
+                return
+            entries = self._snapshot(row["layout"])
+            row["menu"].closeSubMenu()
+            if kind == "delete":
+                self._request_delete(row, entries)
+                return
+            if not self._send_hooks_ok:
+                raise ValueError("Не удалось подключить подтверждение отправки. Файлы сохранены")
+            alert = row["alert"]
+            fragment = get_private_field(alert, "baseFragment")
+            if fragment is None or str(fragment.getClass().getName()) != "org.telegram.ui.ChatActivity":
+                raise ValueError("Откройте галерею вложений в чате")
+            if alert.getEditingMessageObject() is not None or fragment.isInScheduleMode():
+                raise ValueError("Отправка с удалением доступна для новых сообщений без расписания")
+            if fragment.getCurrentEncryptedChat() is not None:
+                raise ValueError("Для секретного чата подтверждение сервера недоступно")
+            account = int(fragment.getCurrentAccount())
+            batch = SendBatch(account, int(fragment.getDialogId()), entries)
+            batch.row = row
+            self._start_observing(account)
+            self._batch = batch
+            if not self._has_direct_delete_access() and not self.get_setting("folder_delete", True):
+                self._bulletin("info", "После успешной отправки Android запросит удаление оригиналов")
+            self._initiating = True
+            try:
+                if kind == "file":
+                    # Native "Send without compression", with caption and confirmations.
+                    row["layout"].onMenuItemClick(1)
+                else:
+                    get_private_field(alert, "writeButton").performClick()
+            finally:
+                self._initiating = False
+            # If validation/confirmation was cancelled, release this batch. No deletion.
+            run_on_ui_thread(lambda: self._expire(batch), 60000)
+        except Exception as error:
+            if self._batch is not None and not self._batch.bound:
+                self._batch = None
+                self._stop_observing()
+            self.log(f"Best gallery: action: {error}")
+            self._bulletin("error", str(error))
+
+    def _plain_send(self, param):
+        """A later normal Send must never inherit a cancelled destructive action."""
+        batch = self._batch
+        if batch is None or self._initiating or batch.bound:
+            return
+        if str(param.method.getName()) == "onMenuItemClick" and int(param.args[0]) not in (0, 1):
+            return
+        alert = param.thisObject
+        if str(param.method.getName()) == "onMenuItemClick":
+            alert = get_private_field(alert, "parentAlert")
+        if alert is not None and self._identity(alert) == self._identity(batch.row["alert"]):
+            self._batch = None
+            self._stop_observing()
+
+    def _expire(self, batch):
+        if self._batch is not batch:
+            return
+        # Upload can be long. Only expire a send that never left the picker,
+        # or a 24-hour batch; never infer success from a timeout.
+        if batch.row["alert"].isShowing() and not batch.bound:
+            self._batch = None
+            self._stop_observing()
+        elif time.monotonic() - batch.created >= 86400:
+            self._batch = None
+            self._stop_observing()
+            self._bulletin("info", "Подтверждение отправки не получено. Оригиналы сохранены")
+        else:
+            run_on_ui_thread(lambda: self._expire(batch), 60000)
+
+    def _start_observing(self, account):
+        from client_utils import get_notification_center
+        from org.telegram.messenger import NotificationCenter
+        from java import dynamic_proxy, jclass
+        plugin = self
+        # Chaquopy forbids subclassing an existing dynamic-proxy subclass.
+        # Implement the Java interface directly rather than the SDK wrapper.
+        class Observer(dynamic_proxy(jclass("org.telegram.messenger.NotificationCenter$NotificationCenterDelegate"))):
+            def didReceivedNotification(self, notification_id, acc, args):
+                try:
+                    plugin._notification(int(notification_id), int(acc), args)
+                except Exception as error:
+                    plugin.log(f"Best gallery: acknowledgement: {error}")
+        observer = Observer()
+        center = get_notification_center(account)
+        self._observer = observer
+        self._observing_account = account
+        center.addObserver(observer, NotificationCenter.messageReceivedByServer)
+        center.addObserver(observer, NotificationCenter.messageSendError)
+
+    def _stop_observing(self):
+        if self._observer is None:
+            return
+        from client_utils import get_notification_center
+        from org.telegram.messenger import NotificationCenter
+        observer, account = self._observer, self._observing_account
+        self._observer = None
+        self._observing_account = None
+        def remove():
+            center = get_notification_center(account)
+            center.removeObserver(observer, NotificationCenter.messageReceivedByServer)
+            center.removeObserver(observer, NotificationCenter.messageSendError)
+        run_on_ui_thread(remove)
+
+    def _sending_message(self, param):
+        self._track_message(param.thisObject, param.args[0], bool(param.args[1]))
+
+    def _uploading_message(self, param):
+        obj = param.args[0]
+        if obj is not None:
+            self._track_message(param.thisObject, obj.messageOwner, bool(obj.scheduled))
+
+    def _track_message(self, helper, message, scheduled):
+        batch = self._batch
+        if batch is None:
+            return
+        try:
+            from org.telegram.messenger import MessageObject
+            if message is None:
+                return
+            account = int(get_private_field(helper, "currentAccount"))
+            paths = [str(message.attachPath or "")]
+            if message.params is not None:
+                original = message.params.get("originalPath")
+                if original is not None:
+                    paths.append(str(original))
+            already_bound = int(message.id) in batch.bound
+            if batch.bind(account, int(MessageObject.getDialogId(message)), int(message.id), paths, scheduled) and not already_bound:
+                self.log(f"Best gallery: tracked send {message.id}; {len(batch.bound)}/{len(batch.entries)}")
+        except Exception as error:
+            self.log(f"Best gallery: tracking: {error}")
+
+    def _notification(self, notification, account, args):
+        from org.telegram.messenger import NotificationCenter
+        batch = self._batch
+        if batch is None or account != batch.account:
+            return
+        old_id = int(args[0])
+        if notification == NotificationCenter.messageSendError:
+            if old_id in batch.bound:
+                self._batch = None
+                self._stop_observing()
+                self._bulletin("error", "Ошибка отправки. Все оригиналы сохранены")
+            return
+        if notification == NotificationCenter.messageReceivedByServer:
+            if batch.acknowledge(account, int(args[3]), old_id, bool(args[6])):
+                self._batch = None
+                self._stop_observing()
+                self.log(f"Best gallery: all {len(batch.entries)} sends confirmed")
+                run_on_ui_thread(lambda: self._request_delete(batch.row, batch.entries))
+
+    @staticmethod
+    def _resolver():
+        from org.telegram.messenger import ApplicationLoader
+        return ApplicationLoader.applicationContext.getContentResolver()
+
+    @staticmethod
+    def _has_direct_delete_access():
+        from android.os import Build, Environment
+        return int(Build.VERSION.SDK_INT) >= 30 and bool(Environment.isExternalStorageManager())
+
+    @staticmethod
+    def _document_id(entry):
+        from android.os import Environment
+        return storage_document_id(entry["path"], str(Environment.getExternalStorageDirectory().getAbsolutePath()))
+
+    def _folder_document(self, entry):
+        from android.provider import DocumentsContract
+        doc_id = self._document_id(entry)
+        saved = set(self.get_setting("delete_folders", []))
+        grants = self._resolver().getPersistedUriPermissions()
+        for i in range(grants.size()):
+            grant = grants.get(i)
+            tree = grant.getUri()
+            if not grant.isWritePermission() or str(tree) not in saved or str(tree.getAuthority()) != DOCUMENTS_AUTHORITY:
+                continue
+            if tree_contains(str(DocumentsContract.getTreeDocumentId(tree)), doc_id):
+                return DocumentsContract.buildDocumentUriUsingTree(tree, doc_id)
+        return None
+
+    def _prepare_folder_delete(self, request, activity):
+        if not self._alive or self._delete_request is not request:
+            return
+        from android.content import Intent
+        from android.provider import DocumentsContract
+        from java import cast, jclass
+        documents = []
+        for entry in request["entries"]:
+            document = self._folder_document(entry)
+            if document is not None:
+                documents.append(document)
+                continue
+            doc_id = self._document_id(entry)
+            folder = doc_id.rsplit("/", 1)[0] if doc_id and "/" in doc_id else None
+            relative = folder.split(":", 1)[1] if folder else ""
+            if not relative or relative == "Download" or relative.startswith(("Android/data", "Android/obb")):
+                self._bulletin("info", "Для этой папки Android требует подтверждать удаление")
+                self._system_delete(request, activity)
+                return
+            request["awaiting_path"] = entry["path"]
+            intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                            | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION)
+            initial = DocumentsContract.buildDocumentUri(DOCUMENTS_AUTHORITY, folder)
+            # putExtra has both Parcelable and Serializable overloads.
+            intent.putExtra(DocumentsContract.EXTRA_INITIAL_URI, cast(jclass("android.os.Parcelable"), initial))
+            self._bulletin("info", "Разрешите папку один раз: " + relative)
+            activity.startActivityForResult(intent, FOLDER_REQUEST)
+            return
+        request["documents"] = documents
+        self._delete_without_prompt(request)
+
+    def _system_delete(self, request, activity):
+        from android.provider import MediaStore
+        from java.util import ArrayList
+        uris = ArrayList()
+        for entry in request["entries"]:
+            uris.add(self._uri(entry))
+        pending = MediaStore.createDeleteRequest(self._resolver(), uris)
+        activity.startIntentSenderForResult(pending.getIntentSender(), DELETE_REQUEST, None, 0, 0, 0)
+
+    @staticmethod
+    def _uri(entry):
+        from android.provider import MediaStore
+        from android.content import ContentUris
+        from java import jlong
+        base = MediaStore.Video.Media.EXTERNAL_CONTENT_URI if entry["video"] else MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        return ContentUris.withAppendedId(base, jlong(entry["id"]))
+
+    def _validated_entries(self, entries):
+        from java.io import File
+        resolver = self._resolver()
+        valid = []
+        for entry in entries:
+            file = File(entry["path"])
+            if not file.isFile() or int(file.length()) != entry["size"] or int(file.lastModified()) != entry["mtime"]:
+                continue
+            cursor = resolver.query(self._uri(entry), ["_data"], None, None, None)
+            if cursor is not None:
+                try:
+                    if cursor.moveToFirst() and str(cursor.getString(0)) == entry["path"]:
+                        valid.append(entry)
+                finally:
+                    cursor.close()
+        return valid
+
+    def _request_delete(self, row, entries):
+        if not self._alive:
+            return
+        try:
+            from android.os import Build
+            valid = self._validated_entries(entries)
+            if len(valid) != len(entries):
+                raise ValueError("Файлы в галерее изменились. Автоматическое удаление отменено")
+            fragment = get_private_field(row["alert"], "baseFragment")
+            activity = fragment.getParentActivity() if fragment is not None else None
+            if activity is None:
+                raise ValueError("Не удалось открыть подтверждение удаления. Оригиналы сохранены")
+            request = {"row": row, "entries": valid}
+            if self._has_direct_delete_access():
+                self._delete_request = request
+                self._delete_without_prompt(request)
+            elif int(Build.VERSION.SDK_INT) >= 30:
+                self._delete_request = request
+                if self.get_setting("folder_delete", True):
+                    self._prepare_folder_delete(request, activity)
+                else:
+                    self._system_delete(request, activity)
+            else:
+                from ui.alert import AlertDialogBuilder
+                self._delete_request = request
+                (AlertDialogBuilder(activity).set_title("Удалить с устройства?")
+                 .set_message(f"Файлов: {len(valid)}. Удаление оригиналов нельзя отменить.")
+                 .set_positive_button("Удалить", lambda *args: self._delete_without_prompt(request))
+                 .set_negative_button("Отмена", lambda *args: self._cancel_delete(request))
+                 .set_on_cancel_listener(lambda *args: self._cancel_delete(request)).show())
+        except Exception as error:
+            self._delete_request = None
+            self.log(f"Best gallery: delete request: {error}")
+            self._bulletin("error", str(error))
+
+    def _cancel_delete(self, request):
+        if self._delete_request is request:
+            self._delete_request = None
+            self._bulletin("info", "Удаление отменено. Оригиналы сохранены")
+
+    def _delete_without_prompt(self, request):
+        from client_utils import run_on_queue
+        def work():
+            try:
+                if not self._alive or self._delete_request is not request:
+                    return
+                valid = self._validated_entries(request["entries"])
+                if len(valid) != len(request["entries"]):
+                    raise ValueError("Файлы изменились перед удалением. Оригиналы сохранены")
+                for entry in valid:
+                    if not self._alive or self._delete_request is not request:
+                        return
+                    try:
+                        if "documents" in request:
+                            from android.provider import DocumentsContract
+                            document = self._folder_document(entry)
+                            if document is None:
+                                raise ValueError("Доступ к папке отозван")
+                            DocumentsContract.deleteDocument(self._resolver(), document)
+                        else:
+                            self._resolver().delete(self._uri(entry), None, None)
+                    except Exception as error:
+                        self.log(f"Best gallery: delete: {error}")
+                run_on_ui_thread(lambda: self._finish_delete(request))
+            except Exception as error:
+                self.log(f"Best gallery: direct delete: {error}")
+                run_on_ui_thread(lambda: self._cancel_delete(request))
+        run_on_queue(work)
+
+    def _activity_result(self, param):
+        request = self._delete_request
+        if request is None:
+            return
+        code = int(param.args[0])
+        if code == DELETE_REQUEST:
+            if int(param.args[1]) == -1:
+                self._finish_delete(request)
+            else:
+                self._cancel_delete(request)
+        elif code == FOLDER_REQUEST:
+            data = param.args[2]
+            if int(param.args[1]) != -1 or data is None or data.getData() is None:
+                self._cancel_delete(request)
+                return
+            try:
+                from android.content import Intent
+                from android.provider import DocumentsContract
+                uri = data.getData()
+                entry = next(e for e in request["entries"] if e["path"] == request.get("awaiting_path"))
+                if str(uri.getAuthority()) != DOCUMENTS_AUTHORITY or not tree_contains(
+                        str(DocumentsContract.getTreeDocumentId(uri)), self._document_id(entry)):
+                    raise ValueError("Выбрана другая папка. Оригиналы сохранены")
+                flags = int(data.getFlags()) & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                if not flags & Intent.FLAG_GRANT_WRITE_URI_PERMISSION:
+                    raise ValueError("Нет разрешения на изменение файлов. Оригиналы сохранены")
+                self._resolver().takePersistableUriPermission(uri, flags)
+                saved = list(self.get_setting("delete_folders", []))
+                if str(uri) not in saved:
+                    saved.append(str(uri))
+                    self.set_setting("delete_folders", saved)
+                self.log("Best gallery: folder access saved")
+                run_on_ui_thread(lambda: self._prepare_folder_delete(request, param.thisObject))
+            except Exception as error:
+                self._delete_request = None
+                self.log(f"Best gallery: folder access: {error}")
+                self._bulletin("error", str(error))
+
+    def _finish_delete(self, request):
+        from java.io import File
+        from java.util import HashMap, ArrayList
+        from org.telegram.messenger import MediaController
+        self._delete_request = None
+        deleted = [entry for entry in request["entries"] if not File(entry["path"]).exists()]
+        if not deleted:
+            self._bulletin("info", "Файлы остались на устройстве")
+            return
+        row = request["row"]
+        # Static selection may already belong to a newly opened picker. Remove
+        # only the same id AND path, rather than clearing everybody's selection.
+        selected = row["layout"].getSelectedPhotos()
+        order = row["layout"].getSelectedPhotosOrder()
+        remaining = HashMap(selected)
+        remaining_order = ArrayList(order)
+        for entry in deleted:
+            current = remaining.get(entry["key"])
+            if current is not None and str(current.path) == entry["path"]:
+                remaining.remove(entry["key"])
+                remaining_order.remove(entry["key"])
+        row["layout"].updateSelected(remaining, remaining_order, True)
+        row["alert"].updateCountButton(0)
+        MediaController.loadGalleryPhotosAlbums(0)
+        self.log(f"Best gallery: deleted {len(deleted)}/{len(request['entries'])}")
+        self._bulletin("success", f"Удалено с устройства: {len(deleted)}")
