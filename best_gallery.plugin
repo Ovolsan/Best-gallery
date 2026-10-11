@@ -8,7 +8,7 @@ __id__ = "best_gallery"
 __name__ = "Best gallery"
 __description__ = "Три кнопки в галерее: удалить, отправить и удалить, отправить файлом и удалить. Удаление после подтверждённой отправки."
 __author__ = "Ovolsan; original: @itNotMax / @MaxExteraPlugins"
-__version__ = "20261011"
+__version__ = "20261011.1"
 __icon__ = "msg_gallery"
 __min_version__ = "12.10.6"
 __app_version__ = ">=12.10.6"
@@ -31,11 +31,11 @@ ALERT = "org.telegram.ui.Components.ChatAttachAlert"
 SEND_HELPER = "org.telegram.messenger.SendMessagesHelper"
 
 # Small outline glyphs, with the same rounded strokes as the native menu.
-# The media glyph deliberately ends in pixels, rather than an HQ/SD label.
+# A complete photo outline distinguishes media send from the spoiler icon.
 _ARROW = '<path d="M13 22h8m-3-3 3 3-3 3"/>'
 ICONS = {
-    "media": '<path d="M14 5H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h7m-7-4 4-4 4 4m-6-6h.01"/>'
-             '<path d="M17 5h.01m4 0h.01m-4 4h.01m4 0h.01m-4 4h.01m4 0h.01m-4 4h.01m4 0h.01"/>' + _ARROW,
+    "media": '<path d="M5 5h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Z"/>'
+             '<path d="m5 16 4-5 4 4 3-3 3 4m-4-8h.01"/>' + _ARROW,
     "file": '<path d="M13 3H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h8m0-16 6 6v4M13 3v6h6"/>' + _ARROW,
 }
 
@@ -56,7 +56,9 @@ def matches_original_path(value, path):
         return True
     if not value.startswith(path):
         return False
-    return bool(re.fullmatch(r"\d+_\d+(?:_\d+)*(?:_m)?(?:_\d+)?", value[len(path):]))
+    # Video start/end can be -1 (untrimmed), including after conversion when
+    # attachPath points at Telegram's cache instead of the original file.
+    return bool(re.fullmatch(r"\d+_\d+(?:_-?\d+)*(?:_m)?(?:_\d+)?", value[len(path):]))
 
 
 def storage_document_id(path, primary_root):
@@ -480,11 +482,13 @@ class BestGalleryPlugin(BasePlugin):
     def _expire(self, batch):
         if self._batch is not batch:
             return
-        # Upload can be long. Only expire a send that never left the picker,
-        # or a 24-hour batch; never infer success from a timeout.
-        if batch.row["alert"].isShowing() and not batch.bound:
+        # A dismissed picker is not proof that any message was tracked. An
+        # unbound send must release the lock as well; never delete on timeout.
+        # Bound uploads may take longer, so retain their server-ACK observer.
+        if not batch.bound:
             self._batch = None
             self._stop_observing()
+            self._bulletin("info", "Не удалось отследить отправку. Оригиналы сохранены")
         elif time.monotonic() - batch.created >= 86400:
             self._batch = None
             self._stop_observing()
@@ -511,6 +515,7 @@ class BestGalleryPlugin(BasePlugin):
         self._observing_account = account
         center.addObserver(observer, NotificationCenter.messageReceivedByServer)
         center.addObserver(observer, NotificationCenter.messageSendError)
+        center.addObserver(observer, NotificationCenter.messagesDeleted)
 
     def _stop_observing(self):
         if self._observer is None:
@@ -524,6 +529,7 @@ class BestGalleryPlugin(BasePlugin):
             center = get_notification_center(account)
             center.removeObserver(observer, NotificationCenter.messageReceivedByServer)
             center.removeObserver(observer, NotificationCenter.messageSendError)
+            center.removeObserver(observer, NotificationCenter.messagesDeleted)
         run_on_ui_thread(remove)
 
     def _sending_message(self, param):
@@ -532,9 +538,11 @@ class BestGalleryPlugin(BasePlugin):
     def _uploading_message(self, param):
         obj = param.args[0]
         if obj is not None:
-            self._track_message(param.thisObject, obj.messageOwner, bool(obj.scheduled))
+            video = obj.videoEditedInfo
+            original = str(video.originalPath) if video is not None and video.originalPath is not None else None
+            self._track_message(param.thisObject, obj.messageOwner, bool(obj.scheduled), original)
 
-    def _track_message(self, helper, message, scheduled):
+    def _track_message(self, helper, message, scheduled, video_original=None):
         batch = self._batch
         if batch is None:
             return
@@ -544,6 +552,8 @@ class BestGalleryPlugin(BasePlugin):
                 return
             account = int(get_private_field(helper, "currentAccount"))
             paths = [str(message.attachPath or "")]
+            if video_original:
+                paths.append(video_original)
             if message.params is not None:
                 original = message.params.get("originalPath")
                 if original is not None:
@@ -558,6 +568,13 @@ class BestGalleryPlugin(BasePlugin):
         from org.telegram.messenger import NotificationCenter
         batch = self._batch
         if batch is None or account != batch.account:
+            return
+        if notification == NotificationCenter.messagesDeleted:
+            ids = args[0]
+            if not bool(args[2]) and any(int(ids.get(i)) in batch.bound for i in range(ids.size())):
+                self._batch = None
+                self._stop_observing()
+                self._bulletin("info", "Отправка отменена. Все оригиналы сохранены")
             return
         old_id = int(args[0])
         if notification == NotificationCenter.messageSendError:

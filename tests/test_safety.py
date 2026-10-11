@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 import types
 import unittest
+from unittest.mock import patch
 
 
 def load_plugin():
@@ -62,6 +63,90 @@ class SafetyTests(unittest.TestCase):
         self.assertTrue(batch.bind(1, 123, -1, ["/DCIM/photo0.jpg"]))
         self.assertFalse(batch.bind(1, 123, -2, ["/DCIM/photo0.jpg"]))
         self.assertFalse(batch.acknowledge(1, 123, -1))
+
+    def test_converted_untrimmed_video_can_bind_original_with_negative_times(self):
+        path = "/DCIM/video.mp4"
+        batch = plugin.SendBatch(1, 123, [{"send_paths": {path}}])
+        # Native code concatenates duration directly after lastModified.
+        original = path + "53266_17916600000004000_-1_-1"
+        self.assertTrue(batch.bind(1, 123, -7, ["/cache/converted.mp4", original]))
+        self.assertTrue(batch.acknowledge(1, 123, -7))
+        for value in [path + ".backup53266_17916600000004000_-1_-1",
+                      path + "53266_17916600000004000_-1_-1/other"]:
+            self.assertFalse(plugin.matches_original_path(value, path))
+
+    def test_trimmed_muted_video_and_photo_require_both_acknowledgements(self):
+        video, photo = "/DCIM/video.mp4", "/DCIM/photo.jpg"
+        batch = plugin.SendBatch(1, 123, [{"send_paths": {video}}, {"send_paths": {photo}}])
+        self.assertTrue(batch.bind(1, 123, -7, [video + "53266_17916600000002500_500000_-1_m_480"]))
+        self.assertTrue(batch.bind(1, 123, -8, [photo + "1234_1791660000000"]))
+        self.assertFalse(batch.acknowledge(1, 123, -7))
+        self.assertTrue(batch.acknowledge(1, 123, -8))
+
+    def test_upload_hook_passes_video_editor_original_path(self):
+        instance = plugin.BestGalleryPlugin()
+        tracked = []
+        instance._track_message = lambda *args: tracked.append(args)
+        owner = object()
+        obj = types.SimpleNamespace(messageOwner=owner, scheduled=False,
+                                    videoEditedInfo=types.SimpleNamespace(originalPath="/DCIM/video.mp4"))
+        instance._uploading_message(types.SimpleNamespace(thisObject="helper", args=[obj]))
+        self.assertEqual(tracked, [("helper", owner, False, "/DCIM/video.mp4")])
+
+    def test_untracked_send_releases_lock_even_after_picker_closed(self):
+        instance = plugin.BestGalleryPlugin()
+        batch = self.batch(1)
+        batch.row = {"alert": types.SimpleNamespace(isShowing=lambda: False)}
+        instance._batch = batch
+        stopped, notices = [], []
+        instance._stop_observing = lambda: stopped.append(True)
+        instance._bulletin = lambda *args: notices.append(args)
+        instance._request_delete = lambda *args: self.fail("Timeout tried deletion")
+        instance._expire(batch)
+        self.assertIsNone(instance._batch)
+        self.assertEqual(stopped, [True])
+        self.assertIn("сохранены", notices[0][1])
+
+    def test_long_tracked_upload_keeps_waiting_without_timeout_deletion(self):
+        instance = plugin.BestGalleryPlugin()
+        batch = self.batch(1)
+        batch.bind(1, 123, -1, ["/DCIM/photo0.jpg"])
+        instance._batch = batch
+        instance._stop_observing = lambda: self.fail("Valid upload was cancelled")
+        timers = []
+        with patch.object(plugin, "run_on_ui_thread", lambda f, delay: timers.append(delay)):
+            instance._expire(batch)
+        self.assertIs(instance._batch, batch)
+        self.assertEqual(timers, [60000])
+
+    def test_stale_timeout_cannot_cancel_a_new_batch(self):
+        instance = plugin.BestGalleryPlugin()
+        previous, current = self.batch(1), self.batch(1)
+        instance._batch = current
+        instance._stop_observing = lambda: self.fail("Old timeout cancelled new send")
+        instance._expire(previous)
+        self.assertIs(instance._batch, current)
+
+    def test_cancelled_upload_releases_lock_and_late_ack_cannot_delete(self):
+        instance = plugin.BestGalleryPlugin()
+        batch = self.batch(1)
+        batch.bind(1, 123, -7, ["/DCIM/photo0.jpg"])
+        instance._batch = batch
+        instance._stop_observing = lambda: None
+        instance._bulletin = lambda *args: None
+        instance._request_delete = lambda *args: self.fail("Cancelled upload tried deletion")
+        messenger = types.ModuleType("org.telegram.messenger")
+        messenger.NotificationCenter = types.SimpleNamespace(messagesDeleted=1, messageSendError=2,
+                                                              messageReceivedByServer=3)
+        def ids(*values):
+            return types.SimpleNamespace(size=lambda: len(values), get=lambda i: values[i])
+        with patch.dict(sys.modules, {"org.telegram.messenger": messenger}):
+            for account, scheduled, deleted in [(2, False, -7), (1, True, -7), (1, False, -8)]:
+                instance._notification(1, account, [ids(deleted), 0, scheduled])
+                self.assertIs(instance._batch, batch)
+            instance._notification(1, 1, [ids(-7), 0, False])
+            self.assertIsNone(instance._batch)
+            instance._notification(3, 1, [-7, 77, None, 123, None, None, False])
 
     def test_folder_grant_cannot_escape_its_directory_or_volume(self):
         self.assertTrue(plugin.tree_contains("primary:Pictures", "primary:Pictures/Demo/photo.jpg"))
