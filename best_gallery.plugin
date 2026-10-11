@@ -8,7 +8,7 @@ __id__ = "best_gallery"
 __name__ = "Best gallery"
 __description__ = "Три кнопки в галерее: удалить, отправить и удалить, отправить файлом и удалить. Удаление после подтверждённой отправки."
 __author__ = "Ovolsan; original: @itNotMax / @MaxExteraPlugins"
-__version__ = "20261011.1"
+__version__ = "20261011.2"
 __icon__ = "msg_gallery"
 __min_version__ = "12.10.6"
 __app_version__ = ">=12.10.6"
@@ -31,10 +31,10 @@ ALERT = "org.telegram.ui.Components.ChatAttachAlert"
 SEND_HELPER = "org.telegram.messenger.SendMessagesHelper"
 
 # Small outline glyphs, with the same rounded strokes as the native menu.
-# A complete photo outline distinguishes media send from the spoiler icon.
+# The photo frame leaves the same lower-right arrow cutout as the file glyph.
 _ARROW = '<path d="M13 22h8m-3-3 3 3-3 3"/>'
 ICONS = {
-    "media": '<path d="M5 5h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Z"/>'
+    "media": '<path d="M13 19H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v6"/>'
              '<path d="m5 16 4-5 4 4 3-3 3 4m-4-8h.01"/>' + _ARROW,
     "file": '<path d="M13 3H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h8m0-16 6 6v4M13 3v6h6"/>' + _ARROW,
 }
