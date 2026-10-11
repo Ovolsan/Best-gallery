@@ -2,7 +2,7 @@
 
 Плагин для **exteraless**, который добавляет в галерею вложений три действия: удалить выбранные файлы, отправить и удалить, отправить файлом и удалить.
 
-**Версия: 20261011.2.** Проверено на exteraless `12.10.6-00c14f4` ([12.10.6-beta14](https://github.com/exteraless/exteraless/releases/tag/v12.10.6-beta14)), Android 11.
+**Версия: 20261011.3.** Проверено на exteraless `12.10.6-00c14f4` ([12.10.6-beta14](https://github.com/exteraless/exteraless/releases/tag/v12.10.6-beta14)), Android 11.
 
 [Скачать плагин](https://github.com/Ovolsan/Best-gallery/releases/latest/download/best_gallery.plugin) · [RAW-ссылка](https://raw.githubusercontent.com/Ovolsan/Best-gallery/main/best_gallery.plugin) · [Релизы](https://github.com/Ovolsan/Best-gallery/releases)
 
